@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <algorithm>
+#include <fstream>
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -35,7 +36,26 @@ constexpr bool enable_validation_layers = true;
 class HelloTriangleApplication
 {
 public:
-    
+    static std::vector<char> readFile(const std::string& filename)
+    {
+        std::ifstream file(filename, std::ios::ate | std::ios::binary); // start reading at the end of the file and in binary
+
+        if (!file.is_open())
+        {
+            throw std::runtime_error("Failed to open file!");
+        }
+
+        std::vector<char> buffer(file.tellg()); // use the end of file position to determine the size of the file and allocate a buffer
+
+        // go back to beginning of file and read all at once
+        file.seekg(0, std::ios::beg);
+        file.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        file.close();
+
+        return buffer;
+
+        
+    }
 
     void run()
     {
@@ -61,6 +81,8 @@ private:
         _pickPhysicalDevice();
         _createLogicalDevice();
         _createSwapChain();
+        _createImageViews();
+        _createGraphicsPipeline();
     }
 
     void _createInstance()
@@ -306,6 +328,60 @@ private:
 
         _swap_chain = vk::raii::SwapchainKHR(_device, swap_chain_create_info);
         _swap_chain_images = _swap_chain.getImages();
+    }
+    void _createImageViews()
+    {
+        _swap_chain_image_views.clear();
+
+        vk::ImageViewCreateInfo image_view_create_info {
+            .viewType = vk::ImageViewType::e2D,
+            .format = _swap_chain_image_format,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}   // describes the image's purpose and which part of the image should be accessed
+        };
+
+        // create an image view for each swap chain image
+        for (auto image : _swap_chain_images)
+        {
+            image_view_create_info.image = image;
+            _swap_chain_image_views.emplace_back(_device, image_view_create_info);
+        }
+
+
+    }
+
+    [[nodiscard]] vk::raii::ShaderModule _createShaderModule(const std::vector<char>& code) const
+    {
+        vk::ShaderModuleCreateInfo create_info{
+            .codeSize = code.size() * sizeof(char),
+            // bytecode pointer is uint32_t, not char, so we cast the pointer with reinterpret_cast
+            // alignment requirements are met implicitly because data is stored in std::vector where default allocator ensures the data satisfies worst case alignemnt requirements
+            .pCode = reinterpret_cast<const uint32_t*>(code.data()) 
+        };
+
+        // shader module is just a thin wrapper around the shader bytecode that we've loaded from file
+        vk::raii::ShaderModule shader_module{ _device, create_info };
+
+        return shader_module;
+    }
+
+    void _createGraphicsPipeline()
+    {
+        auto shader_code = readFile("shaders/slang.spv");
+        vk::raii::ShaderModule shader_module = _createShaderModule(shader_code);
+
+        vk::PipelineShaderStageCreateInfo vert_shader_stage_info{
+            .stage = vk::ShaderStageFlagBits::eVertex,
+            .module = shader_module,
+            .pName = "vertMain" // the entrypoint
+        };
+
+        vk::PipelineShaderStageCreateInfo frag_shader_stage_info{
+            .stage = vk::ShaderStageFlagBits::eFragment,
+            .module = shader_module,
+            .pName = "fragMain" // the entrypoint
+        };
+
+        vk::PipelineShaderStageCreateInfo shader_stages[] = {vert_shader_stage_info, frag_shader_stage_info};
     }
 
     void _mainLoop()
