@@ -27,6 +27,11 @@ std::vector<const char*> device_extensions = {
     vk::KHRCreateRenderpass2ExtensionName
 };
 
+std::vector<vk::DynamicState> dynamic_states = {
+    vk::DynamicState::eViewport,
+    vk::DynamicState::eScissor
+};
+
 #ifdef NDEBUG
 constexpr bool enable_validation_layers = false;
 #else
@@ -369,12 +374,14 @@ private:
         auto shader_code = readFile("shaders/slang.spv");
         vk::raii::ShaderModule shader_module = _createShaderModule(shader_code);
 
+        // vertex shader info
         vk::PipelineShaderStageCreateInfo vert_shader_stage_info{
             .stage = vk::ShaderStageFlagBits::eVertex,
             .module = shader_module,
             .pName = "vertMain" // the entrypoint
         };
 
+        // fragment shader info
         vk::PipelineShaderStageCreateInfo frag_shader_stage_info{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = shader_module,
@@ -382,6 +389,100 @@ private:
         };
 
         vk::PipelineShaderStageCreateInfo shader_stages[] = {vert_shader_stage_info, frag_shader_stage_info};
+
+
+        // dynamic parts of the pipeline - determined by the dynamic_states vector
+        vk::PipelineDynamicStateCreateInfo dynamic_state { 
+            .dynamicStateCount = static_cast<uint32_t>(dynamic_states.size()),
+            .pDynamicStates = dynamic_states.data()
+        };
+
+        // describes the format of the vertex data that will be passed to the vertex shader
+        vk::PipelineVertexInputStateCreateInfo vertex_input_info;   // nothing for now since we've hardcoded the vertices
+
+        // describes what kind of geometry will be drawn from the vertices
+        // if primitive restart is enabled, then we can break up lines and triangles in strips by using the special index 0xFFFF
+        vk::PipelineInputAssemblyStateCreateInfo input_assembly{
+            .topology = vk::PrimitiveTopology::eTriangleList
+        };
+
+        // viewport describes the region of the framebuffer tthe output will be rendered to
+        // scissor rectangle defines in which region pixels will actually be stored (a filter rather than a transformation)
+        // the rasterizer discards any pixels outside the scissored rectangle
+        vk::PipelineViewportStateCreateInfo viewport_state {
+            .viewportCount = 1,
+            .scissorCount = 1
+        };
+
+        // rasterizer takes geometry shaped by the vertices from the vertex shader and turns it into fragments to be colored by the fragment shader
+        vk::PipelineRasterizationStateCreateInfo rasterizer {
+            .depthClampEnable = vk::False,
+            .rasterizerDiscardEnable = vk::False,   // if true, then fragments beyond the near and far planes are clamped to them (instead of being discarded)
+            .polygonMode = vk::PolygonMode::eFill,  // fill the area of the polygon with fragments
+            .cullMode = vk::CullModeFlagBits::eBack,    // the type of face culling to use
+            .frontFace = vk::FrontFace::eClockwise,
+            .depthBiasEnable = vk::False,
+            .depthBiasSlopeFactor = 1.0f,
+            .lineWidth = 1.0f
+        };
+
+        // configure multisampling (one of the ways to perform antialiasing)
+        // combines the fragment shader results of multiple polygons that rasterize to the same pixel
+        vk::PipelineMultisampleStateCreateInfo multisampling {
+            .rasterizationSamples = vk::SampleCountFlagBits::e1,
+            .sampleShadingEnable = vk::False
+        };
+
+        // after a fragment shader has returned a color, it needs to be combined with the color that is already in the framebuffer
+        // this transformation is known as color blending - we can either mix the two values or combine the two values with a bitwise operation
+        vk::PipelineColorBlendAttachmentState color_blend_attachment;
+        // alpha blending - new color blended with the old color based on its opacity
+        color_blend_attachment.blendEnable = vk::True;
+        color_blend_attachment.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+        color_blend_attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+        color_blend_attachment.colorBlendOp = vk::BlendOp::eAdd;
+        color_blend_attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+        color_blend_attachment.dstAlphaBlendFactor = vk::BlendFactor::eZero;
+        color_blend_attachment.alphaBlendOp = vk::BlendOp::eAdd;
+
+        vk::PipelineColorBlendStateCreateInfo color_blending {
+            .logicOpEnable = vk::False,  // not doing bitwise combination
+            .logicOp = vk::LogicOp::eCopy,
+            .attachmentCount = 1,
+            .pAttachments = &color_blend_attachment
+        };
+
+        vk::PipelineLayoutCreateInfo pipeline_layout_info {
+            .setLayoutCount = 0,
+            .pushConstantRangeCount = 0
+        };
+
+        _pipeline_layout = vk::raii::PipelineLayout(_device, pipeline_layout_info); // also can define "push constants"
+        
+
+        // specify the formats of the attachments that will be used during rendering (to use dynamic rendering)
+        vk::PipelineRenderingCreateInfo pipeline_rendering_create_info {
+            .colorAttachmentCount = 1,  // we will use one color attachment with the format of our swap chain images
+            .pColorAttachmentFormats = &_swap_chain_image_format
+        };
+
+        vk::GraphicsPipelineCreateInfo pipeline_info {
+            .pNext = &pipeline_rendering_create_info,
+            .stageCount = 2,
+            .pStages = shader_stages,
+            .pVertexInputState = &vertex_input_info,
+            .pInputAssemblyState = &input_assembly,
+            .pViewportState = &viewport_state,
+            .pRasterizationState = &rasterizer,
+            .pMultisampleState = &multisampling,
+            .pColorBlendState = &color_blending,
+            .pDynamicState = &dynamic_state,
+            .layout = _pipeline_layout,
+            .renderPass = nullptr   // this is set to nullptr since we are using dynamic rendering instead of a traditional render pass
+        };
+
+        _graphics_pipeline = vk::raii::Pipeline(_device, nullptr, pipeline_info);
+
     }
 
     void _mainLoop()
@@ -422,4 +523,8 @@ private:
     vk::Format _swap_chain_image_format = vk::Format::eUndefined;
     vk::Extent2D _swap_chain_extent;
     std::vector<vk::raii::ImageView> _swap_chain_image_views;
+
+    vk::raii::PipelineLayout _pipeline_layout = nullptr;   // specifies "uniform" values which can pass dynamic values to shaders
+
+    vk::raii::Pipeline _graphics_pipeline = nullptr;    // the graphics pipeline
 };
