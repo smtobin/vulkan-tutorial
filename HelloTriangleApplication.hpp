@@ -88,6 +88,8 @@ private:
         _createSwapChain();
         _createImageViews();
         _createGraphicsPipeline();
+        _createCommandPool();
+        _createCommandBuffer();
     }
 
     void _createInstance()
@@ -208,25 +210,25 @@ private:
         std::vector<vk::QueueFamilyProperties> queue_family_properties = _physical_device.getQueueFamilyProperties();
         
         // get the first index into queueFamilyProperties which supports both graphics and present
-        uint32_t queue_index = ~0u;
+        _graphics_index = ~0u;
         for (uint32_t qfpIndex = 0; qfpIndex < queue_family_properties.size(); qfpIndex++)
         {
             if ((queue_family_properties[qfpIndex].queueFlags & vk::QueueFlagBits::eGraphics) &&
                 _physical_device.getSurfaceSupportKHR(qfpIndex, *_surface))
             {
             // found a queue family that supports both graphics and present
-            queue_index = qfpIndex;
+            _graphics_index = qfpIndex;
             break;
             }
         }
-        if (queue_index == ~0u)
+        if (_graphics_index == ~0u)
         {
             throw std::runtime_error("Could not find a queue for graphics and present -> terminating");
         }
 
         float queue_priority = 0.0f;
         vk::DeviceQueueCreateInfo device_queue_create_info { 
-            .queueFamilyIndex = queue_index, 
+            .queueFamilyIndex = _graphics_index, 
             .queueCount = 1, 
             .pQueuePriorities = &queue_priority 
         };
@@ -249,7 +251,7 @@ private:
         _device = vk::raii::Device(_physical_device, device_create_info);
 
         // get a handle to the graphics queue
-        _queue = vk::raii::Queue(_device, queue_index, 0);
+        _queue = vk::raii::Queue(_device, _graphics_index, 0);
     }
 
 
@@ -485,6 +487,134 @@ private:
 
     }
 
+    void _createCommandPool()
+    {
+        vk::CommandPoolCreateInfo pool_info {
+            .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,    // we are recording a command buffer every frame so we want to be able to reset and rerecord over it
+            .queueFamilyIndex = _graphics_index // command ubffers are executed by submitting them on one of the device queues
+        };
+
+        _command_pool = vk::raii::CommandPool(_device, pool_info);
+    }
+
+    void _createCommandBuffer()
+    {
+        vk::CommandBufferAllocateInfo alloc_info {
+            .commandPool = _command_pool,
+            .level = vk::CommandBufferLevel::ePrimary,  // primary = submitted to a queue for execution, but cannot be called from other command buffers
+            // secondary = cannot be submitted directly, but can be called from primary command buffers
+            .commandBufferCount = 1
+        };
+
+        _command_buffer = std::move(vk::raii::CommandBuffers(_device, alloc_info).front());
+    }
+
+    void _recordCommandBuffer(uint32_t image_index)
+    {
+        _command_buffer.begin( {} );    // this will reset _command_buffer if it has already been recorded - not possible to append commands
+
+        // before starting rendering, transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
+        _transitionImageLayout(
+            image_index,
+            vk::ImageLayout::eUndefined,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            {}, // srcAccessMask (no need to wait for previous operations)
+            vk::AccessFlagBits2::eColorAttachmentWrite, // dstAccessMask
+            vk::PipelineStageFlagBits2::eTopOfPipe, // srcStage
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput  // dstStage
+        );
+
+        // set up the color attachment
+        vk::ClearValue clear_color = vk::ClearColorValue(0.f, 0.f, 0.f, 1.0f);
+        vk::RenderingAttachmentInfo attachment_info = {
+            .imageView = _swap_chain_image_views[image_index],  // which image view to render to
+            .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,    // the layout the image will be in during rendering
+            .loadOp = vk::AttachmentLoadOp::eClear, // what to do with the image before rendering
+            .storeOp = vk::AttachmentStoreOp::eStore,   // what to do with the image after rendering
+            .clearValue = clear_color
+        };
+
+        // set up rendering info
+        vk::RenderingInfo rendering_info = {
+            .renderArea = { .offset = {0,0}, .extent = _swap_chain_extent}, // defines the size of the render area
+            .layerCount = 1,    // number of layers to render to (1 for a non-layered image)
+            .colorAttachmentCount = 1,  // specify color attachments to render to
+            .pColorAttachments = &attachment_info
+        };
+
+        // now we can begin rendering
+        _command_buffer.beginRendering(rendering_info);
+
+        // bind the graphics pipeline
+        _command_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, _graphics_pipeline);
+
+        // since we specified viewport and scissor state for the pipeline as dynamic, we need to set them here before issuing the draw command
+        _command_buffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(_swap_chain_extent.width), static_cast<float>(_swap_chain_extent.height), 0.0f, 1.0f));
+        _command_buffer.setScissor(0, vk::Rect2D(vk::Offset2D(0,0), _swap_chain_extent));
+
+        // issue the draw command for the triangle
+        _command_buffer.draw(
+            3,  // vertexCount - 3 vertices to draw
+            1,  // instanceCount - use 1 if not using
+            0,  // firstVertex - used as an offset into the vertex buffer, defines the lowest value of SV_VertexId
+            0   // firstInstance - used as an offset for isntanced rendering, defines the lowest value of SV_InstanceId
+        );
+
+        _command_buffer.endRendering();
+
+        // transition the image layout back to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR so it can be presented to the screen
+        _transitionImageLayout(
+            image_index,
+            vk::ImageLayout::eColorAttachmentOptimal,
+            vk::ImageLayout::ePresentSrcKHR,
+            vk::AccessFlagBits2::eColorAttachmentWrite,
+            {},
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits2::eBottomOfPipe
+        );
+
+        _command_buffer.end();
+    }
+
+    void _transitionImageLayout(
+        uint32_t image_index,
+        vk::ImageLayout old_layout,
+        vk::ImageLayout new_layout,
+        vk::AccessFlags2 src_access_mask,
+        vk::AccessFlags2 dst_access_mask,
+        vk::PipelineStageFlags2 src_stage_mask,
+        vk::PipelineStageFlags2 dst_stage_mask
+    ) {
+        // transition the image layout from old to new
+        // used for transitioning an image layout to one that is suitable for rendering
+        vk::ImageMemoryBarrier2 barrier = {
+            .srcStageMask = src_stage_mask,
+            .srcAccessMask = src_access_mask,
+            .dstStageMask = dst_stage_mask,
+            .dstAccessMask = dst_access_mask,
+            .oldLayout = old_layout,
+            .newLayout = new_layout,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = _swap_chain_images[image_index],
+            .subresourceRange = {
+                .aspectMask = vk::ImageAspectFlagBits::eColor,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1
+            }
+        };
+
+        vk::DependencyInfo dependency_info = {
+            .dependencyFlags = {},
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &barrier
+        };
+
+        _command_buffer.pipelineBarrier2(dependency_info);
+    }
+
     void _mainLoop()
     {
         // keep application running until error occurs or window is closed
@@ -510,6 +640,7 @@ private:
     vk::raii::Instance _instance = nullptr; // the Vulkan instance - the connection between this application and the Vulkan library
 
     vk::raii::PhysicalDevice _physical_device = nullptr; // the graphics card
+    uint32_t _graphics_index;   // the index of the queue family for the device queue of our graphics card
 
     vk::raii::Device _device = nullptr; // the logical device that interfaces with the graphics card
 
@@ -527,4 +658,7 @@ private:
     vk::raii::PipelineLayout _pipeline_layout = nullptr;   // specifies "uniform" values which can pass dynamic values to shaders
 
     vk::raii::Pipeline _graphics_pipeline = nullptr;    // the graphics pipeline
+
+    vk::raii::CommandPool _command_pool = nullptr;  // manages the memory used to store the buffers
+    vk::raii::CommandBuffer _command_buffer = nullptr; // the command buffer
 };
