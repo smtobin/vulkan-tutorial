@@ -90,6 +90,7 @@ private:
         _createGraphicsPipeline();
         _createCommandPool();
         _createCommandBuffer();
+        _createSyncObjects();
     }
 
     void _createInstance()
@@ -234,9 +235,11 @@ private:
         };
 
         vk::PhysicalDeviceFeatures device_features;
-        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> feature_chain = {
+        vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features,
+             vk::PhysicalDeviceVulkan13Features, vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT> feature_chain = {
             {},     // empty for now
-            {.dynamicRendering = true},         // enable dynamic rendering from Vulkan 1.3
+            {.shaderDrawParameters = true},
+            {.synchronization2 = true, .dynamicRendering = true},         // enable dynamic rendering from Vulkan 1.3
             {.extendedDynamicState = true}      // enable extended dynamic state from the extension
         };
 
@@ -373,7 +376,7 @@ private:
 
     void _createGraphicsPipeline()
     {
-        auto shader_code = readFile("shaders/slang.spv");
+        auto shader_code = readFile("../shaders/slang.spv");
         vk::raii::ShaderModule shader_module = _createShaderModule(shader_code);
 
         // vertex shader info
@@ -435,17 +438,21 @@ private:
             .sampleShadingEnable = vk::False
         };
 
-        // after a fragment shader has returned a color, it needs to be combined with the color that is already in the framebuffer
-        // this transformation is known as color blending - we can either mix the two values or combine the two values with a bitwise operation
-        vk::PipelineColorBlendAttachmentState color_blend_attachment;
-        // alpha blending - new color blended with the old color based on its opacity
-        color_blend_attachment.blendEnable = vk::True;
-        color_blend_attachment.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
-        color_blend_attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-        color_blend_attachment.colorBlendOp = vk::BlendOp::eAdd;
-        color_blend_attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-        color_blend_attachment.dstAlphaBlendFactor = vk::BlendFactor::eZero;
-        color_blend_attachment.alphaBlendOp = vk::BlendOp::eAdd;
+        // // after a fragment shader has returned a color, it needs to be combined with the color that is already in the framebuffer
+        // // this transformation is known as color blending - we can either mix the two values or combine the two values with a bitwise operation
+        // vk::PipelineColorBlendAttachmentState color_blend_attachment;
+        // // alpha blending - new color blended with the old color based on its opacity
+        // color_blend_attachment.blendEnable = vk::True;
+        // color_blend_attachment.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+        // color_blend_attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+        // color_blend_attachment.colorBlendOp = vk::BlendOp::eAdd;
+        // color_blend_attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+        // color_blend_attachment.dstAlphaBlendFactor = vk::BlendFactor::eZero;
+        // color_blend_attachment.alphaBlendOp = vk::BlendOp::eAdd;
+
+        vk::PipelineColorBlendAttachmentState color_blend_attachment{ .blendEnable = vk::False,
+            .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA
+        };
 
         vk::PipelineColorBlendStateCreateInfo color_blending {
             .logicOpEnable = vk::False,  // not doing bitwise combination
@@ -615,13 +622,66 @@ private:
         _command_buffer.pipelineBarrier2(dependency_info);
     }
 
+    void _createSyncObjects()
+    {
+        _present_complete_semaphore = vk::raii::Semaphore(_device, vk::SemaphoreCreateInfo());
+        _render_finished_semaphore = vk::raii::Semaphore(_device, vk::SemaphoreCreateInfo());
+        _draw_fence = vk::raii::Fence(_device, {.flags = vk::FenceCreateFlagBits::eSignaled});
+    }
+
     void _mainLoop()
     {
         // keep application running until error occurs or window is closed
         while (!glfwWindowShouldClose(_window))
         {
             glfwPollEvents();
+            _drawFrame();
         }
+
+        _device.waitIdle();
+    }
+
+    void _drawFrame()
+    {
+        _queue.waitIdle();  // essentially waits for all fences to signal
+        // vkWaitForFences();
+
+        auto [result, image_index] = _swap_chain.acquireNextImage(
+            UINT64_MAX, // no timeout
+            *_present_complete_semaphore,   // signal the present complete semphore that the next image has been acquired
+            nullptr // not dependent on other sync objects since we already waited for fences
+        );
+
+        // record the command buffer to the swap chain image
+        _recordCommandBuffer(image_index);
+
+        // make sure the fence is reset
+        _device.resetFences(*_draw_fence);
+        
+        vk::PipelineStageFlags wait_destination_stage_mask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
+        vk::SubmitInfo submit_info {
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &*_present_complete_semaphore,  // which semaphore(s) to wait on before execution begins
+            .pWaitDstStageMask = &wait_destination_stage_mask,// which stage(s) of the pipieline to wait - want to wait for writing colors to the image until it's available
+            .commandBufferCount = 1,
+            .pCommandBuffers = &*_command_buffer,  // which command buffer(s) to submit for execution
+            .signalSemaphoreCount = 1,
+            .pSignalSemaphores = &*_render_finished_semaphore    // which semaphores to signal once the command buffer(s) have finished execution
+        };
+        _queue.submit(submit_info, *_draw_fence);
+
+        // the CPU needs to wait while the GPU finishes rendering the frame we just submitted
+        while ( vk::Result::eTimeout == _device.waitForFences( *_draw_fence, vk::True, UINT64_MAX ) )
+            ;
+        
+        vk::PresentInfoKHR present_info_KHR {
+            .waitSemaphoreCount = 1,
+            .pWaitSemaphores = &*_render_finished_semaphore,   // which semaphore(s) to wait on before presentation can happen
+            .swapchainCount = 1,
+            .pSwapchains = &*_swap_chain,  // the swap chain(s) to present images to
+            .pImageIndices = &image_index // the index of the image for each swap chain
+        };
+        result = _queue.presentKHR(present_info_KHR);
     }
 
     void _cleanup()
@@ -661,4 +721,8 @@ private:
 
     vk::raii::CommandPool _command_pool = nullptr;  // manages the memory used to store the buffers
     vk::raii::CommandBuffer _command_buffer = nullptr; // the command buffer
+
+    vk::raii::Semaphore _present_complete_semaphore = nullptr;  // indicates that an image has been acquired form the swapchain and is ready for rendering
+    vk::raii::Semaphore _render_finished_semaphore = nullptr;   // indicates that the rendering has finished and presentation can happen
+    vk::raii::Fence _draw_fence = nullptr;  // to make usre only one frame is rendered at a time
 };
