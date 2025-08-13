@@ -16,6 +16,8 @@
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 
+constexpr int MAX_FRAMES_IN_FLIGHT = 2;
+
 const std::vector validation_layers = {
     "VK_LAYER_KHRONOS_validation"
 };
@@ -74,9 +76,17 @@ private:
     {
         glfwInit(); // initialize GLFW
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);   // tells GLFW to not create an OpenGL context
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);     // disable resizable windows
+        // glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);     // disable resizable windows
 
         _window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);    // (width, height, title, (optional) monitor, (optional) OpenGL-specific)
+        glfwSetWindowUserPointer(_window, this);
+        glfwSetFramebufferSizeCallback(_window, _framebufferResizeCallback);
+    }
+
+    static void _framebufferResizeCallback(GLFWwindow* window, int width, int height)
+    {
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        app->_frame_buffer_resized = true;
     }
 
     void _initVulkan()
@@ -89,7 +99,7 @@ private:
         _createImageViews();
         _createGraphicsPipeline();
         _createCommandPool();
-        _createCommandBuffer();
+        _createCommandBuffers();
         _createSyncObjects();
     }
 
@@ -359,6 +369,33 @@ private:
 
     }
 
+    void _cleanupSwapChain()
+    {
+        _swap_chain_image_views.clear();
+        _swap_chain = nullptr;
+    }
+
+    void _recreateSwapChain()
+    {
+        // check if the window was minimized
+        // in this case, width and height will be exactly 0
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(_window, &width, &height);
+        while (width == 0 || height == 0)
+        {
+            // wait until not minimized anymore
+            glfwGetFramebufferSize(_window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        _device.waitIdle();
+
+        _cleanupSwapChain();
+
+        _createSwapChain();
+        _createImageViews();
+    }
+
     [[nodiscard]] vk::raii::ShaderModule _createShaderModule(const std::vector<char>& code) const
     {
         vk::ShaderModuleCreateInfo create_info{
@@ -504,21 +541,23 @@ private:
         _command_pool = vk::raii::CommandPool(_device, pool_info);
     }
 
-    void _createCommandBuffer()
+    void _createCommandBuffers()
     {
+        _command_buffers.clear();
+
         vk::CommandBufferAllocateInfo alloc_info {
             .commandPool = _command_pool,
             .level = vk::CommandBufferLevel::ePrimary,  // primary = submitted to a queue for execution, but cannot be called from other command buffers
             // secondary = cannot be submitted directly, but can be called from primary command buffers
-            .commandBufferCount = 1
+            .commandBufferCount = MAX_FRAMES_IN_FLIGHT
         };
 
-        _command_buffer = std::move(vk::raii::CommandBuffers(_device, alloc_info).front());
+        _command_buffers = vk::raii::CommandBuffers(_device, alloc_info);
     }
 
     void _recordCommandBuffer(uint32_t image_index)
     {
-        _command_buffer.begin( {} );    // this will reset _command_buffer if it has already been recorded - not possible to append commands
+        _command_buffers[_current_frame].begin( {} );    // this will reset _command_buffer if it has already been recorded - not possible to append commands
 
         // before starting rendering, transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
         _transitionImageLayout(
@@ -550,24 +589,24 @@ private:
         };
 
         // now we can begin rendering
-        _command_buffer.beginRendering(rendering_info);
+        _command_buffers[_current_frame].beginRendering(rendering_info);
 
         // bind the graphics pipeline
-        _command_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, _graphics_pipeline);
+        _command_buffers[_current_frame].bindPipeline(vk::PipelineBindPoint::eGraphics, _graphics_pipeline);
 
         // since we specified viewport and scissor state for the pipeline as dynamic, we need to set them here before issuing the draw command
-        _command_buffer.setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(_swap_chain_extent.width), static_cast<float>(_swap_chain_extent.height), 0.0f, 1.0f));
-        _command_buffer.setScissor(0, vk::Rect2D(vk::Offset2D(0,0), _swap_chain_extent));
+        _command_buffers[_current_frame].setViewport(0, vk::Viewport(0.0f, 0.0f, static_cast<float>(_swap_chain_extent.width), static_cast<float>(_swap_chain_extent.height), 0.0f, 1.0f));
+        _command_buffers[_current_frame].setScissor(0, vk::Rect2D(vk::Offset2D(0,0), _swap_chain_extent));
 
         // issue the draw command for the triangle
-        _command_buffer.draw(
+        _command_buffers[_current_frame].draw(
             3,  // vertexCount - 3 vertices to draw
             1,  // instanceCount - use 1 if not using
             0,  // firstVertex - used as an offset into the vertex buffer, defines the lowest value of SV_VertexId
             0   // firstInstance - used as an offset for isntanced rendering, defines the lowest value of SV_InstanceId
         );
 
-        _command_buffer.endRendering();
+        _command_buffers[_current_frame].endRendering();
 
         // transition the image layout back to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR so it can be presented to the screen
         _transitionImageLayout(
@@ -580,7 +619,7 @@ private:
             vk::PipelineStageFlagBits2::eBottomOfPipe
         );
 
-        _command_buffer.end();
+        _command_buffers[_current_frame].end();
     }
 
     void _transitionImageLayout(
@@ -619,14 +658,25 @@ private:
             .pImageMemoryBarriers = &barrier
         };
 
-        _command_buffer.pipelineBarrier2(dependency_info);
+        _command_buffers[_current_frame].pipelineBarrier2(dependency_info);
     }
 
     void _createSyncObjects()
     {
-        _present_complete_semaphore = vk::raii::Semaphore(_device, vk::SemaphoreCreateInfo());
-        _render_finished_semaphore = vk::raii::Semaphore(_device, vk::SemaphoreCreateInfo());
-        _draw_fence = vk::raii::Fence(_device, {.flags = vk::FenceCreateFlagBits::eSignaled});
+        _present_complete_semaphores.clear();
+        _render_finished_semaphores.clear();
+        _in_flight_fences.clear();
+
+        for (unsigned i = 0; i < _swap_chain_images.size(); i++)
+        {
+            _present_complete_semaphores.emplace_back(_device, vk::SemaphoreCreateInfo());
+            _render_finished_semaphores.emplace_back(_device, vk::SemaphoreCreateInfo());
+        }
+
+        for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            _in_flight_fences.emplace_back(_device, vk::FenceCreateInfo{ .flags = vk::FenceCreateFlagBits::eSignaled});
+        }
     }
 
     void _mainLoop()
@@ -643,45 +693,59 @@ private:
 
     void _drawFrame()
     {
-        _queue.waitIdle();  // essentially waits for all fences to signal
-        // vkWaitForFences();
+        while (vk::Result::eTimeout == _device.waitForFences(*_in_flight_fences[_current_frame], vk::True, UINT64_MAX))
+            ;
 
         auto [result, image_index] = _swap_chain.acquireNextImage(
             UINT64_MAX, // no timeout
-            *_present_complete_semaphore,   // signal the present complete semphore that the next image has been acquired
+            *_present_complete_semaphores[_semaphore_index],   // signal the present complete semphore that the next image has been acquired
             nullptr // not dependent on other sync objects since we already waited for fences
         );
 
-        // record the command buffer to the swap chain image
-        _recordCommandBuffer(image_index);
+        if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR || _frame_buffer_resized)
+        {
+            _frame_buffer_resized = false;
+            _recreateSwapChain();
+            return;
+        }
+        else if (result != vk::Result::eSuccess)
+        {
+            throw std::runtime_error("Failed to acquire swap chain image!");
+        }
 
-        // make sure the fence is reset
-        _device.resetFences(*_draw_fence);
+        _device.resetFences(*_in_flight_fences[_current_frame]);
+
+        // record the command buffer to the swap chain image
+        _command_buffers[_current_frame].reset();
+        _recordCommandBuffer(image_index);
         
         vk::PipelineStageFlags wait_destination_stage_mask(vk::PipelineStageFlagBits::eColorAttachmentOutput);
         vk::SubmitInfo submit_info {
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &*_present_complete_semaphore,  // which semaphore(s) to wait on before execution begins
+            .pWaitSemaphores = &*_present_complete_semaphores[_semaphore_index],  // which semaphore(s) to wait on before execution begins
             .pWaitDstStageMask = &wait_destination_stage_mask,// which stage(s) of the pipieline to wait - want to wait for writing colors to the image until it's available
             .commandBufferCount = 1,
-            .pCommandBuffers = &*_command_buffer,  // which command buffer(s) to submit for execution
+            .pCommandBuffers = &*_command_buffers[_current_frame],  // which command buffer(s) to submit for execution
             .signalSemaphoreCount = 1,
-            .pSignalSemaphores = &*_render_finished_semaphore    // which semaphores to signal once the command buffer(s) have finished execution
+            .pSignalSemaphores = &*_render_finished_semaphores[image_index]    // which semaphores to signal once the command buffer(s) have finished execution
         };
-        _queue.submit(submit_info, *_draw_fence);
+        _queue.submit(submit_info, *_in_flight_fences[_current_frame]);
 
         // the CPU needs to wait while the GPU finishes rendering the frame we just submitted
-        while ( vk::Result::eTimeout == _device.waitForFences( *_draw_fence, vk::True, UINT64_MAX ) )
-            ;
+        // while ( vk::Result::eTimeout == _device.waitForFences( *_draw_fence, vk::True, UINT64_MAX ) )
+        //     ;
         
         vk::PresentInfoKHR present_info_KHR {
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &*_render_finished_semaphore,   // which semaphore(s) to wait on before presentation can happen
+            .pWaitSemaphores = &*_render_finished_semaphores[image_index],   // which semaphore(s) to wait on before presentation can happen
             .swapchainCount = 1,
             .pSwapchains = &*_swap_chain,  // the swap chain(s) to present images to
             .pImageIndices = &image_index // the index of the image for each swap chain
         };
         result = _queue.presentKHR(present_info_KHR);
+
+        _semaphore_index = (_semaphore_index + 1) % _present_complete_semaphores.size();
+        _current_frame = (_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
 
     void _cleanup()
@@ -720,9 +784,14 @@ private:
     vk::raii::Pipeline _graphics_pipeline = nullptr;    // the graphics pipeline
 
     vk::raii::CommandPool _command_pool = nullptr;  // manages the memory used to store the buffers
-    vk::raii::CommandBuffer _command_buffer = nullptr; // the command buffer
+    std::vector<vk::raii::CommandBuffer> _command_buffers; // the command buffer
 
-    vk::raii::Semaphore _present_complete_semaphore = nullptr;  // indicates that an image has been acquired form the swapchain and is ready for rendering
-    vk::raii::Semaphore _render_finished_semaphore = nullptr;   // indicates that the rendering has finished and presentation can happen
-    vk::raii::Fence _draw_fence = nullptr;  // to make usre only one frame is rendered at a time
+    std::vector<vk::raii::Semaphore> _present_complete_semaphores;  // indicates that an image has been acquired form the swapchain and is ready for rendering - one for each image in the swap chain
+    std::vector<vk::raii::Semaphore> _render_finished_semaphores;   // indicates that the rendering has finished and presentation can happen - one for each image in the swap chain
+    std::vector<vk::raii::Fence> _in_flight_fences;  // to make sure only one frame is rendered at a time
+
+    uint32_t _current_frame = 0;    // keep track of the current frame
+    uint32_t _semaphore_index = 0;  // the index of the semaphore we're using to know if the image in the swap chain has been presented
+
+    bool _frame_buffer_resized = false; // whether or not the frame buffer has been resized
 };
