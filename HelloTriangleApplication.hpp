@@ -702,17 +702,6 @@ private:
             nullptr // not dependent on other sync objects since we already waited for fences
         );
 
-        if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR || _frame_buffer_resized)
-        {
-            _frame_buffer_resized = false;
-            _recreateSwapChain();
-            return;
-        }
-        else if (result != vk::Result::eSuccess)
-        {
-            throw std::runtime_error("Failed to acquire swap chain image!");
-        }
-
         _device.resetFences(*_in_flight_fences[_current_frame]);
 
         // record the command buffer to the swap chain image
@@ -743,6 +732,16 @@ private:
             .pImageIndices = &image_index // the index of the image for each swap chain
         };
         result = _queue.presentKHR(present_info_KHR);
+
+        if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR || _frame_buffer_resized)
+        {
+            _frame_buffer_resized = false;
+            _recreateSwapChain();
+        }
+        else if (result != vk::Result::eSuccess)
+        {
+            throw std::runtime_error("Failed to acquire swap chain image!");
+        }
 
         _semaphore_index = (_semaphore_index + 1) % _present_complete_semaphores.size();
         _current_frame = (_current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
